@@ -23,18 +23,74 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 
 public class App {
+
     public static void main(String[] args) {
+        // Сервіси створюємо один раз на всю програму
+        OcrService ocr = new OcrService();
+        TranslationService translator = new TranslationService();
+
         SwingUtilities.invokeLater(() ->
-                new Screenshot().selectRegion(region -> {
-                    // Тут пізніше буде OCR + переклад.
-                    // Поки що просто зберігаємо вибрану область для перевірки.
-                    System.out.println(new TranslationService().translate(new OcrService().detectTextFromImage(region)
-                            ,"en"
-                            ,"uk"));
-                }));
+                new Screenshot().selectRegion(selection ->
+                        translateInBackground(selection, ocr, translator)));
+    }
+
+    /**
+     * Показує вікно "Перекладаю…", а OCR і переклад виконує у фоновому потоці,
+     * щоб інтерфейс не зависав. Результат повертається в потік Swing.
+     */
+    private static void translateInBackground(Selection selection, OcrService ocr, TranslationService translator) {
+        ResultWindow window = new ResultWindow(selection.bounds());
+        window.setText("Перекладаю…");
+        window.display();
+
+        new SwingWorker<String, Void>() {
+            @Override
+            protected String doInBackground() {
+                String text = TextUtils.clean(ocr.detectTextFromImage(selection.image()));
+                if (text.length() < 2) {
+                    return null; // нічого не розпізнано
+                }
+                return translator.translateLong(text, "en", "uk");
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    String result = get();
+                    window.setText(result == null ? "Текст не знайдено" : result);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    window.setText("Помилка: " + cause.getMessage());
+                }
+            }
+        }.execute();
+    }
+}
+
+/** Вибрана область: зображення + її положення на екрані. */
+record Selection(BufferedImage image, Rectangle bounds) {
+}
+
+class TextUtils {
+
+    /** Прибирає переноси рядків з OCR, щоб речення не ламалися при перекладі. */
+    static String clean(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text
+                .replaceAll("(?<=\\p{L})-\\s*\\n\\s*", "") // "inter-\nnational" -> "international"
+                .replaceAll("\\s*\\n\\s*", " ")
+                .replaceAll("\\s{2,}", " ")
+                .trim();
     }
 }
 
@@ -83,10 +139,10 @@ class Screenshot {
 
     /**
      * Показує "заморожений" екран на весь розмір. Користувач виділяє область мишею.
-     * Після відпускання кнопки викликається onSelected з вирізаним зображенням.
-     * Esc скасовує вибір. Метод треба викликати з потоку Swing (EDT).
+     * Після відпускання кнопки викликається onSelected. Esc скасовує вибір.
+     * Метод треба викликати з потоку Swing (EDT).
      */
-    public void selectRegion(Consumer<BufferedImage> onSelected) {
+    public void selectRegion(Consumer<Selection> onSelected) {
         int w = getScreenWidth();
         int h = getScreenHeight();
 
@@ -98,10 +154,10 @@ class Screenshot {
         window.setAlwaysOnTop(true);
         window.setBounds(0, 0, w, h);
 
-        SelectionPanel panel = new SelectionPanel(full, region -> {
+        SelectionPanel panel = new SelectionPanel(full, selection -> {
             window.dispose();
-            if (region != null) {
-                onSelected.accept(region);
+            if (selection != null) {
+                onSelected.accept(selection);
             }
         });
 
@@ -114,7 +170,7 @@ class Screenshot {
 class SelectionPanel extends JPanel {
 
     private final BufferedImage screenshot;
-    private final Consumer<BufferedImage> onDone; // null = скасовано
+    private final Consumer<Selection> onDone; // null = скасовано
 
     private int startX;
     private int endX;
@@ -122,7 +178,7 @@ class SelectionPanel extends JPanel {
     private int endY;
     private boolean dragging = false;
 
-    SelectionPanel(BufferedImage screenshot, Consumer<BufferedImage> onDone) {
+    SelectionPanel(BufferedImage screenshot, Consumer<Selection> onDone) {
         this.screenshot = screenshot;
         this.onDone = onDone;
 
@@ -168,9 +224,7 @@ class SelectionPanel extends JPanel {
         });
     }
 
-    /**
-     * Прямокутник у координатах панелі; працює для будь-якого напрямку перетягування.
-     */
+    /** Прямокутник у координатах панелі; працює для будь-якого напрямку перетягування. */
     private Rectangle selection() {
         int x = Math.min(startX, endX);
         int y = Math.min(startY, endY);
@@ -197,7 +251,8 @@ class SelectionPanel extends JPanel {
         int w = Math.min((int) (r.width * scaleX), screenshot.getWidth() - x);
         int h = Math.min((int) (r.height * scaleY), screenshot.getHeight() - y);
 
-        onDone.accept(screenshot.getSubimage(x, y, w, h));
+        // Вікно виділення розташоване в (0,0), тому координати панелі = координати екрана
+        onDone.accept(new Selection(screenshot.getSubimage(x, y, w, h), r));
     }
 
     @Override
@@ -212,7 +267,7 @@ class SelectionPanel extends JPanel {
         g2.setColor(new Color(0, 0, 0, 110));
         g2.fillRect(0, 0, getWidth(), getHeight());
 
-        // 3) Виділена область: малюємо знімок без затемнення + червона рамка
+        // 3) Виділена область: знімок без затемнення + червона рамка
         if (dragging) {
             Rectangle r = selection();
             g2.setClip(r);
@@ -228,12 +283,92 @@ class SelectionPanel extends JPanel {
     }
 }
 
+/** Невелике вікно з перекладом біля виділеної області. Закривається Esc або кнопкою ×. */
+class ResultWindow {
+
+    private final JFrame frame = new JFrame();
+    private final JTextArea area = new JTextArea();
+
+    ResultWindow(Rectangle target) {
+        frame.setUndecorated(true);
+        frame.setAlwaysOnTop(true);
+
+        area.setEditable(false);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.setFont(new Font("SansSerif", Font.PLAIN, 16));
+        area.setBackground(new Color(30, 30, 30));
+        area.setForeground(Color.WHITE);
+        area.setMargin(new Insets(8, 10, 8, 10));
+
+        JScrollPane scroll = new JScrollPane(area);
+        scroll.setBorder(null);
+
+        JLabel hint = new JLabel("  Esc — закрити");
+        hint.setForeground(Color.LIGHT_GRAY);
+
+        JButton close = new JButton("×");
+        close.setFocusable(false);
+        close.addActionListener(e -> frame.dispose());
+
+        JPanel top = new JPanel(new BorderLayout());
+        top.setBackground(new Color(50, 50, 50));
+        top.add(hint, BorderLayout.WEST);
+        top.add(close, BorderLayout.EAST);
+
+        frame.getContentPane().setLayout(new BorderLayout());
+        frame.getContentPane().add(top, BorderLayout.NORTH);
+        frame.getContentPane().add(scroll, BorderLayout.CENTER);
+        frame.getRootPane().setBorder(BorderFactory.createLineBorder(Color.GRAY));
+
+        frame.getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke("ESCAPE"), "close");
+        frame.getRootPane().getActionMap().put("close", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                frame.dispose();
+            }
+        });
+
+        place(target);
+    }
+
+    /** Ставить вікно під областю; якщо не вміщується, то над нею. */
+    private void place(Rectangle target) {
+        Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+        int w = Math.max(320, Math.min(target.width, 640));
+        int h = 180;
+        int x = Math.max(0, Math.min(target.x, screen.width - w));
+        int y = target.y + target.height + 8;
+        if (y + h > screen.height) {
+            y = Math.max(0, target.y - h - 8);
+        }
+        frame.setBounds(x, y, w, h);
+    }
+
+    void setText(String text) {
+        area.setText(text);
+        area.setCaretPosition(0);
+    }
+
+    void display() {
+        frame.setVisible(true);
+        frame.toFront();
+        frame.requestFocus();
+    }
+}
+
 class OcrService {
 
-    public String detectTextFromImage(BufferedImage image) {
-        Tesseract tesseract = new Tesseract();
+    private final Tesseract tesseract = new Tesseract();
+
+    OcrService() {
         tesseract.setDatapath("C:/Users/necha/Documents/ideaproj/in progress/Screen Translator Proj");
         tesseract.setLanguage("eng");
+    }
+
+    // Tesseract не потокобезпечний, тому synchronized
+    public synchronized String detectTextFromImage(BufferedImage image) {
         try {
             return tesseract.doOCR(image);
         } catch (TesseractException e) {
@@ -241,11 +376,23 @@ class OcrService {
         }
     }
 }
+
 class TranslationService {
+
+    private static final int MAX_BYTES = 450; // MyMemory приймає ~500 байтів на запит
 
     private final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
+
+    /** Розбиває довгий текст на частини за реченнями, перекладає кожну й склеює. */
+    public String translateLong(String text, String from, String to) {
+        List<String> translated = new ArrayList<>();
+        for (String chunk : splitIntoChunks(text, MAX_BYTES)) {
+            translated.add(translate(chunk, from, to));
+        }
+        return String.join(" ", translated);
+    }
 
     public String translate(String text, String from, String to) {
         String q = URLEncoder.encode(text, StandardCharsets.UTF_8);
@@ -273,5 +420,56 @@ class TranslationService {
             Thread.currentThread().interrupt();
             throw new RuntimeException(e);
         }
+    }
+
+    // ---------- розбиття тексту на частини ----------
+
+    private static int bytes(CharSequence s) {
+        return s.toString().getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    static List<String> splitIntoChunks(String text, int maxBytes) {
+        List<String> chunks = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+
+        for (String sentence : text.split("(?<=[.!?])\\s+")) {
+            for (String piece : splitLong(sentence, maxBytes)) {
+                if (current.length() > 0 && bytes(current) + 1 + bytes(piece) > maxBytes) {
+                    chunks.add(current.toString());
+                    current.setLength(0);
+                }
+                if (current.length() > 0) {
+                    current.append(' ');
+                }
+                current.append(piece);
+            }
+        }
+        if (current.length() > 0) {
+            chunks.add(current.toString());
+        }
+        return chunks;
+    }
+
+    /** Якщо одне речення довше за ліміт, ріжемо його по словах. */
+    private static List<String> splitLong(String sentence, int maxBytes) {
+        if (bytes(sentence) <= maxBytes) {
+            return List.of(sentence);
+        }
+        List<String> parts = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        for (String word : sentence.split(" ")) {
+            if (current.length() > 0 && bytes(current) + 1 + bytes(word) > maxBytes) {
+                parts.add(current.toString());
+                current.setLength(0);
+            }
+            if (current.length() > 0) {
+                current.append(' ');
+            }
+            current.append(word);
+        }
+        if (current.length() > 0) {
+            parts.add(current.toString());
+        }
+        return parts;
     }
 }
