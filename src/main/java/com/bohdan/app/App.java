@@ -1,5 +1,7 @@
 package com.bohdan.app;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import net.sourceforge.tess4j.Tesseract;
 import net.sourceforge.tess4j.TesseractException;
 import org.slf4j.Logger;
@@ -14,6 +16,13 @@ import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.function.Consumer;
 
 public class App {
@@ -22,7 +31,9 @@ public class App {
                 new Screenshot().selectRegion(region -> {
                     // Тут пізніше буде OCR + переклад.
                     // Поки що просто зберігаємо вибрану область для перевірки.
-                    System.out.println(new OcrService().detectTextFromImage(region));
+                    System.out.println(new TranslationService().translate(new OcrService().detectTextFromImage(region)
+                            ,"en"
+                            ,"uk"));
                 }));
     }
 }
@@ -219,13 +230,47 @@ class SelectionPanel extends JPanel {
 
 class OcrService {
 
-    public String detectTextFromImage(BufferedImage image){
+    public String detectTextFromImage(BufferedImage image) {
         Tesseract tesseract = new Tesseract();
         tesseract.setDatapath("C:/Users/necha/Documents/ideaproj/in progress/Screen Translator Proj");
         tesseract.setLanguage("eng");
         try {
             return tesseract.doOCR(image);
         } catch (TesseractException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+class TranslationService {
+
+    private final HttpClient client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .build();
+
+    public String translate(String text, String from, String to) {
+        String q = URLEncoder.encode(text, StandardCharsets.UTF_8);
+        String pair = URLEncoder.encode(from + "|" + to, StandardCharsets.UTF_8);
+        String url = "https://api.mymemory.translated.net/get?q=%s&langpair=%s".formatted(q, pair);
+
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofSeconds(10))
+                .GET()
+                .build();
+        try {
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                throw new RuntimeException("HTTP " + response.statusCode() + ": " + response.body());
+            }
+            JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
+            int status = json.get("responseStatus").getAsInt();
+            if (status != 200) {
+                throw new RuntimeException("MyMemory " + status + ": " + json);
+            }
+            return json.getAsJsonObject("responseData").get("translatedText").getAsString();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             throw new RuntimeException(e);
         }
     }
