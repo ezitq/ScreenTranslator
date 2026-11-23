@@ -1,5 +1,9 @@
 package com.bohdan.app;
 
+import com.github.kwhat.jnativehook.GlobalScreen;
+import com.github.kwhat.jnativehook.NativeHookException;
+import com.github.kwhat.jnativehook.keyboard.NativeKeyEvent;
+import com.github.kwhat.jnativehook.keyboard.NativeKeyListener;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.sourceforge.tess4j.Tesseract;
@@ -27,17 +31,153 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
+import java.util.logging.Level;
+import java.util.prefs.Preferences;
 
 public class App {
 
-    public static void main(String[] args) {
-        // Сервіси створюємо один раз на всю програму
-        OcrService ocr = new OcrService();
-        TranslationService translator = new TranslationService();
+    // Гаряча клавіша: Ctrl + Shift + E (змініть HOTKEY_CODE та HOTKEY_LABEL, якщо треба)
+    private static final int HOTKEY_CODE = NativeKeyEvent.VC_E;
+    private static final String HOTKEY_LABEL = "Ctrl+Shift+E";
 
-        SwingUtilities.invokeLater(() ->
-                new Screenshot().selectRegion(selection ->
-                        translateInBackground(selection, ocr, translator)));
+    // Сервіси створюємо один раз на всю програму
+    private static final OcrService OCR = new OcrService();
+    private static final TranslationService TRANSLATOR = new TranslationService();
+
+    // Ці поля використовуються лише з потоку Swing
+    private static boolean selecting = false;
+    private static ResultWindow currentResult;
+
+    public static void main(String[] args) {
+        registerHotkey();
+        SwingUtilities.invokeLater(App::setupTray);
+    }
+
+    /** Запускає вибір області. Ігнорується, якщо вибір уже відкритий. */
+    private static void startSelection() {
+        if (selecting) {
+            return;
+        }
+        selecting = true;
+
+        // Закриваємо попередній переклад, щоб він не потрапив на новий знімок екрана
+        if (currentResult != null) {
+            currentResult.close();
+            currentResult = null;
+        }
+
+        // Невелика пауза, щоб старе вікно встигло зникнути з екрана до знімка
+        javax.swing.Timer delay = new javax.swing.Timer(150, e ->
+                new Screenshot().selectRegion(selection -> {
+                    selecting = false;
+                    if (selection != null) {
+                        translateInBackground(selection, OCR, TRANSLATOR);
+                    }
+                }));
+        delay.setRepeats(false);
+        delay.start();
+    }
+
+    /** Реєструє глобальну гарячу клавішу (працює, навіть коли вікно програми не в фокусі). */
+    private static void registerHotkey() {
+        // JNativeHook за замовчуванням дуже балакучий
+        java.util.logging.Logger.getLogger(GlobalScreen.class.getPackage().getName())
+                .setLevel(Level.WARNING);
+
+        try {
+            GlobalScreen.registerNativeHook();
+        } catch (NativeHookException e) {
+            throw new RuntimeException("Не вдалося зареєструвати гарячу клавішу", e);
+        }
+
+        GlobalScreen.addNativeKeyListener(new NativeKeyListener() {
+            @Override
+            public void nativeKeyPressed(NativeKeyEvent e) {
+                boolean ctrl = (e.getModifiers() & NativeKeyEvent.CTRL_MASK) != 0;
+                boolean shift = (e.getModifiers() & NativeKeyEvent.SHIFT_MASK) != 0;
+                if (ctrl && shift && e.getKeyCode() == HOTKEY_CODE) {
+                    // Хук працює в окремому потоці, а Swing треба викликати з EDT
+                    SwingUtilities.invokeLater(App::startSelection);
+                }
+            }
+
+            @Override
+            public void nativeKeyReleased(NativeKeyEvent e) {
+            }
+
+            @Override
+            public void nativeKeyTyped(NativeKeyEvent e) {
+            }
+        });
+    }
+
+    /** Іконка в треї: подвійний клік або пункт меню запускають переклад, "Вихід" закриває програму. */
+    private static void setupTray() {
+        if (!SystemTray.isSupported()) {
+            System.err.println("Системний трей недоступний. Програма працює, гаряча клавіша: " + HOTKEY_LABEL);
+            return;
+        }
+
+        BufferedImage icon = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = icon.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setColor(new Color(40, 110, 220));
+        g.fillOval(0, 0, 15, 15);
+        g.setColor(Color.WHITE);
+        g.setFont(new Font("SansSerif", Font.BOLD, 11));
+        g.drawString("T", 4, 12);
+        g.dispose();
+
+        PopupMenu menu = new PopupMenu();
+        MenuItem translate = new MenuItem("Перекласти (" + HOTKEY_LABEL + ")");
+        translate.addActionListener(e -> startSelection());
+        MenuItem exit = new MenuItem("Вихід");
+        exit.addActionListener(e -> shutdown());
+        menu.add(translate);
+        menu.addSeparator();
+        menu.add(languageMenu("Мова оригіналу", Settings.source(), Settings::setSource));
+        menu.add(languageMenu("Перекласти на", Settings.target(), Settings::setTarget));
+        menu.addSeparator();
+        menu.add(exit);
+
+        TrayIcon trayIcon = new TrayIcon(icon, "Screen Translator", menu);
+        trayIcon.setImageAutoSize(true);
+        trayIcon.addActionListener(e -> startSelection()); // подвійний клік
+
+        try {
+            SystemTray.getSystemTray().add(trayIcon);
+            trayIcon.displayMessage("Screen Translator", "Працює у фоні. Натисніть " + HOTKEY_LABEL,
+                    TrayIcon.MessageType.INFO);
+        } catch (AWTException e) {
+            System.err.println("Не вдалося додати іконку в трей: " + e.getMessage());
+        }
+    }
+
+    /** Підменю з мовами: біля вибраної стоїть галочка. */
+    private static Menu languageMenu(String title, Lang current, Consumer<Lang> onPick) {
+        Menu menu = new Menu(title);
+        List<CheckboxMenuItem> items = new ArrayList<>();
+
+        for (Lang lang : Lang.ALL) {
+            CheckboxMenuItem item = new CheckboxMenuItem(lang.name(), lang.equals(current));
+            item.addItemListener(e -> {
+                onPick.accept(lang);
+                for (int i = 0; i < items.size(); i++) {
+                    items.get(i).setState(Lang.ALL.get(i).equals(lang));
+                }
+            });
+            items.add(item);
+            menu.add(item);
+        }
+        return menu;
+    }
+
+    private static void shutdown() {
+        try {
+            GlobalScreen.unregisterNativeHook();
+        } catch (NativeHookException ignored) {
+        }
+        System.exit(0);
     }
 
     /**
@@ -46,17 +186,22 @@ public class App {
      */
     private static void translateInBackground(Selection selection, OcrService ocr, TranslationService translator) {
         ResultWindow window = new ResultWindow(selection.bounds());
+        currentResult = window;
         window.setText("Перекладаю…");
         window.display();
+
+        // Фіксуємо мови на момент запуску, щоб зміна в меню не вплинула на поточний переклад
+        Lang from = Settings.source();
+        Lang to = Settings.target();
 
         new SwingWorker<String, Void>() {
             @Override
             protected String doInBackground() {
-                String text = TextUtils.clean(ocr.detectTextFromImage(selection.image()));
+                String text = TextUtils.clean(ocr.detectTextFromImage(selection.image(), from.ocr()));
                 if (text.length() < 2) {
                     return null; // нічого не розпізнано
                 }
-                return translator.translateLong(text, "en", "uk");
+                return translator.translateLong(text, from.code(), to.code());
             }
 
             @Override
@@ -77,6 +222,51 @@ public class App {
 
 /** Вибрана область: зображення + її положення на екрані. */
 record Selection(BufferedImage image, Rectangle bounds) {
+}
+
+/**
+ * Мова: code для MyMemory, ocr для Tesseract (потрібен файл <ocr>.traineddata у tessdata).
+ */
+record Lang(String code, String name, String ocr) {
+
+    static final List<Lang> ALL = List.of(
+            new Lang("en", "English", "eng"),
+            new Lang("uk", "Українська", "ukr"),
+            new Lang("pl", "Polski", "pol"),
+            new Lang("de", "Deutsch", "deu"),
+            new Lang("fr", "Français", "fra")
+    );
+
+    static Lang byCode(String code) {
+        return ALL.stream().filter(l -> l.code().equals(code)).findFirst().orElse(ALL.get(0));
+    }
+}
+
+/** Вибрані мови зберігаються між запусками (java.util.prefs). */
+class Settings {
+
+    private static final Preferences PREFS = Preferences.userNodeForPackage(Settings.class);
+
+    private static volatile Lang source = Lang.byCode(PREFS.get("source", "en"));
+    private static volatile Lang target = Lang.byCode(PREFS.get("target", "uk"));
+
+    static Lang source() {
+        return source;
+    }
+
+    static Lang target() {
+        return target;
+    }
+
+    static void setSource(Lang lang) {
+        source = lang;
+        PREFS.put("source", lang.code());
+    }
+
+    static void setTarget(Lang lang) {
+        target = lang;
+        PREFS.put("target", lang.code());
+    }
 }
 
 class TextUtils {
@@ -139,7 +329,8 @@ class Screenshot {
 
     /**
      * Показує "заморожений" екран на весь розмір. Користувач виділяє область мишею.
-     * Після відпускання кнопки викликається onSelected. Esc скасовує вибір.
+     * Після відпускання кнопки викликається onSelected з вибраною областю.
+     * Esc скасовує вибір: тоді onSelected викликається з null.
      * Метод треба викликати з потоку Swing (EDT).
      */
     public void selectRegion(Consumer<Selection> onSelected) {
@@ -156,13 +347,13 @@ class Screenshot {
 
         SelectionPanel panel = new SelectionPanel(full, selection -> {
             window.dispose();
-            if (selection != null) {
-                onSelected.accept(selection);
-            }
+            onSelected.accept(selection); // null = скасовано
         });
 
         window.setContentPane(panel);
         window.setVisible(true);
+        window.toFront();
+        window.requestFocus();
         panel.requestFocusInWindow();
     }
 }
@@ -351,6 +542,10 @@ class ResultWindow {
         area.setCaretPosition(0);
     }
 
+    void close() {
+        frame.dispose();
+    }
+
     void display() {
         frame.setVisible(true);
         frame.toFront();
@@ -360,20 +555,63 @@ class ResultWindow {
 
 class OcrService {
 
+    // Шлях можна задати змінною середовища TESSDATA_PATH, інакше береться цей
+    private static final String TESSDATA = System.getenv().getOrDefault(
+            "TESSDATA_PATH", "C:/Users/necha/Documents/ideaproj/in progress/Screen Translator Proj");
+
     private final Tesseract tesseract = new Tesseract();
 
     OcrService() {
-        tesseract.setDatapath("C:/Users/necha/Documents/ideaproj/in progress/Screen Translator Proj");
-        tesseract.setLanguage("eng");
+        tesseract.setDatapath(TESSDATA);
     }
 
     // Tesseract не потокобезпечний, тому synchronized
-    public synchronized String detectTextFromImage(BufferedImage image) {
+    public synchronized String detectTextFromImage(BufferedImage image, String ocrLang) {
         try {
-            return tesseract.doOCR(image);
+            tesseract.setLanguage(ocrLang);
+            return tesseract.doOCR(prepare(image));
         } catch (TesseractException e) {
-            throw new RuntimeException(e);
+            throw new RuntimeException("OCR не вдався. Перевірте, що " + ocrLang
+                    + ".traineddata лежить у " + TESSDATA + " (" + e.getMessage() + ")", e);
         }
+    }
+
+    /**
+     * Покращує зображення перед OCR: збільшує (Tesseract краще читає великі літери)
+     * і інвертує, якщо тло темне (світлий текст на темному).
+     */
+    private static BufferedImage prepare(BufferedImage src) {
+        int scale = Math.max(1, Math.min(src.getHeight() < 200 ? 3 : 2, 3000 / src.getWidth()));
+
+        BufferedImage out = new BufferedImage(
+                src.getWidth() * scale, src.getHeight() * scale, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = out.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        g.drawImage(src, 0, 0, out.getWidth(), out.getHeight(), null);
+        g.dispose();
+
+        // Середня яскравість (беремо кожен 4-й піксель, цього достатньо)
+        long sum = 0;
+        long count = 0;
+        for (int y = 0; y < out.getHeight(); y += 4) {
+            for (int x = 0; x < out.getWidth(); x += 4) {
+                int rgb = out.getRGB(x, y);
+                int r = (rgb >> 16) & 0xFF;
+                int gr = (rgb >> 8) & 0xFF;
+                int b = rgb & 0xFF;
+                sum += (r * 299 + gr * 587 + b * 114) / 1000;
+                count++;
+            }
+        }
+
+        if (count > 0 && sum / count < 128) {
+            for (int y = 0; y < out.getHeight(); y++) {
+                for (int x = 0; x < out.getWidth(); x++) {
+                    out.setRGB(x, y, out.getRGB(x, y) ^ 0x00FFFFFF);
+                }
+            }
+        }
+        return out;
     }
 }
 
